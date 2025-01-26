@@ -1,0 +1,100 @@
+# Feature Extractor Configuration
+
+feature_extractors:
+  options:
+    feature_groups:
+      pricing:
+        - ATM_CALL_PRICE
+        - ATM_PUT_PRICE
+        - ATM_CALL_ASK_BID_SPREAD
+        - ATM_PUT_ASK_BID_SPREAD
+      volume:
+        - TOTAL_CALL_VOLUME
+        - TOTAL_PUT_VOLUME
+        - PUT_CALL_VOLUME_RATIO
+        - ATM_CALL_VOLUME
+        - ATM_PUT_VOLUME
+      open_interest:
+        - TOTAL_CALL_OI
+        - TOTAL_PUT_OI
+        - PUT_CALL_OI_RATIO
+        - ATM_CALL_OI
+        - ATM_PUT_OI
+      implied_volatility:
+        - ATM_CALL_IV
+        - ATM_PUT_IV
+        - WEIGHTED_CALL_IV
+        - WEIGHTED_PUT_IV
+        - IV_SKEW
+        - IV_TERM_STRUCTURE
+      greeks:
+        # Delta features
+        - ATM_CALL_DELTA
+        - ATM_PUT_DELTA
+        - DELTA_SKEW_CALLS
+        - DELTA_SKEW_PUTS
+        - WEIGHTED_CALL_DELTA
+        - WEIGHTED_PUT_DELTA
+        # Gamma features
+        - ATM_CALL_GAMMA
+        - ATM_PUT_GAMMA
+        - GAMMA_EXPOSURE_CALLS
+        - GAMMA_EXPOSURE_PUTS
+        - TOTAL_GAMMA_EXPOSURE
+        # Theta features
+        - ATM_CALL_THETA
+        - ATM_PUT_THETA
+        - THETA_DECAY_RATIO_CALLS
+        - THETA_DECAY_RATIO_PUTS
+        # Vega features
+        - ATM_CALL_VEGA
+        - ATM_PUT_VEGA
+        - VEGA_WEIGHTED_CALLS
+        - VEGA_WEIGHTED_PUTS
+        # Rho features
+        - ATM_CALL_RHO
+        - ATM_PUT_RHO
+      risk_metrics:
+        - PUT_CALL_PARITY_DEVIATION
+        - DELTA_NEUTRAL_RATIO
+        - GAMMA_SCALPING_OPPORTUNITY
+        - THETA_VEGA_RATIO
+    
+    # Default parameters
+    atm_threshold: 0.05
+    
+  technical:
+    feature_groups:
+      momentum:
+        - RSI
+        - MACD
+        - MACD_SIGNAL
+        - MACD_HIST
+        - MOM
+        - ROC
+        - STOCH_K
+        - STOCH_D
+        - WILLR
+      trend:
+        - SMA_10
+        - SMA_20
+        - SMA_50
+        - EMA_10
+        - EMA_20
+        - EMA_50
+        - ADX
+        - CCI
+        - DX
+        - MINUS_DI
+        - PLUS_DI
+      volatility:
+        - ATR
+        - NATR
+        - TRANGE
+        - BBANDS_UPPER
+        - BBANDS_MIDDLE
+        - BBANDS_LOWER
+      volume:
+        - OBV
+        - AD
+        - ADOSC
