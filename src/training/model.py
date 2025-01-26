@@ -5,79 +5,165 @@ Custom model architecture for options trading.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2PreTrainedModel, GPT2Model
+from transformers import GPT2PreTrainedModel, GPT2Model, PretrainedConfig, GPT2Config
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from typing import Optional
+import math
+
+class OptionsGPTConfig(PretrainedConfig):
+    """Configuration class for OptionsGPT model."""
+    model_type = "options_gpt"
+
+    def __init__(
+        self,
+        hidden_size=768,
+        num_layers=12,
+        num_heads=12,
+        dropout=0.1,
+        vocab_size=50257,  # Default GPT2 vocab size
+        n_positions=1024,  # Default GPT2 max sequence length
+        n_ctx=1024,  # Default GPT2 context size
+        n_embd=None,  # Will be set to hidden_size
+        n_layer=None,  # Will be set to num_layers
+        n_head=None,  # Will be set to num_heads
+        n_inner=None,  # Will be set to hidden_size * 4
+        activation_function="gelu_new",  # Default GPT2 activation
+        resid_pdrop=None,  # Will be set to dropout
+        embd_pdrop=None,  # Will be set to dropout
+        attn_pdrop=None,  # Will be set to dropout
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        summary_type="cls_index",
+        summary_use_proj=True,
+        summary_activation=None,
+        summary_proj_to_labels=True,
+        summary_first_dropout=0.1,
+        use_cache=True,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        scale_attn_weights=True,
+        scale_attn_by_inverse_layer_idx=False,
+        reorder_and_upcast_attn=False,
+        **kwargs
+    ):
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
+        
+        # Set main parameters
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.dropout = dropout
+        
+        # Set required GPT2 parameters
+        self.vocab_size = vocab_size
+        self.n_positions = n_positions
+        self.n_ctx = n_ctx
+        self.max_position_embeddings = n_positions
+        
+        # Set aliases for GPT2 compatibility
+        self.n_embd = hidden_size if n_embd is None else n_embd
+        self.n_layer = num_layers if n_layer is None else n_layer
+        self.n_head = num_heads if n_head is None else n_head
+        self.n_inner = hidden_size * 4 if n_inner is None else n_inner
+        self.num_hidden_layers = self.n_layer  # Required by GPT2
+        self.num_attention_heads = self.n_head  # Required by GPT2
+        
+        # Set dropout aliases
+        self.resid_pdrop = dropout if resid_pdrop is None else resid_pdrop
+        self.embd_pdrop = dropout if embd_pdrop is None else embd_pdrop
+        self.attn_pdrop = dropout if attn_pdrop is None else attn_pdrop
+        
+        # Set additional required GPT2 parameters
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.initializer_range = initializer_range
+        self.summary_type = summary_type
+        self.summary_use_proj = summary_use_proj
+        self.summary_activation = summary_activation
+        self.summary_first_dropout = summary_first_dropout
+        self.summary_proj_to_labels = summary_proj_to_labels
+        self.activation_function = activation_function
+        self.scale_attn_weights = scale_attn_weights
+        self.use_cache = use_cache
+        self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
+        self.reorder_and_upcast_attn = reorder_and_upcast_attn
+
+class FeatureProcessor(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.feature_projection = nn.Linear(hidden_size, hidden_size)  # Project from hidden_size to hidden_size
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        # Handle both 3D and 4D inputs
+        if len(x.shape) == 3:
+            # [batch_size, seq_len, hidden_size]
+            batch_size, seq_len, hidden_size = x.shape
+        else:
+            # [batch_size, 1, seq_len, hidden_size]
+            batch_size, _, seq_len, hidden_size = x.shape
+            x = x.squeeze(1)  # Remove the extra dimension
+        
+        # Project features
+        x = self.feature_projection(x)  # [batch_size, seq_len, hidden_size]
+        x = self.layer_norm(x)
+        x = self.dropout(x)
+        
+        return x  # Return in 3D format [batch_size, seq_len, hidden_size]
 
 class TemporalAttention(nn.Module):
-    """Temporal attention mechanism for financial time series."""
-    
-    def __init__(self, hidden_size: int, num_heads: int = 8):
-        """
-        Initialize temporal attention.
-        
-        Args:
-            hidden_size: Size of hidden states
-            num_heads: Number of attention heads
-        """
+    def __init__(self, config):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_size = hidden_size // num_heads
-        self.scaling = self.head_size ** -0.5
+        self.config = config
         
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size, hidden_size)
+        # Multi-head attention
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.query = nn.Linear(config.n_embd, config.n_embd)
+        self.key = nn.Linear(config.n_embd, config.n_embd)
+        self.value = nn.Linear(config.n_embd, config.n_embd)
+        self.attn_drop = nn.Dropout(config.resid_pdrop)
+        self.resid_drop = nn.Dropout(config.resid_pdrop)
+        self.proj = nn.Linear(config.n_embd, config.n_embd)
         
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass of temporal attention.
+    def forward(self, x, mask=None, output_attentions=False):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
         
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, hidden_size)
-            mask: Optional attention mask of shape (batch_size, seq_len, seq_len)
-            
-        Returns:
-            Attended tensor of same shape as input
-        """
-        batch_size, seq_len, hidden_size = x.size()
+        # Linear projections
+        q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
         
-        # Project inputs to Q, K, V
-        q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_size).transpose(1, 2)
-        k = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_size).transpose(1, 2)
-        v = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_size).transpose(1, 2)
+        # Compute attention scores
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, T)
         
-        # Calculate attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
-        
-        # Apply mask if provided
         if mask is not None:
-            # Expand mask for multiple heads
-            mask = mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            att = att.masked_fill(mask[:, None, :, :] == 0, float('-inf'))
         
-        # Apply attention
-        attn = F.softmax(scores, dim=-1)
-        context = torch.matmul(attn, v)
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
         
-        # Reshape and project output
-        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
-        output = self.out(context)
+        # Apply attention to values
+        y = att @ v  # (B, nh, T, hd)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
         
-        return output
+        # Output projection
+        y = self.resid_drop(self.proj(y))
+        
+        if output_attentions:
+            return y, att
+        return y
 
 class FinancialFeatureProcessor(nn.Module):
-    """Process financial features with domain-specific layers."""
-    
     def __init__(self, config):
-        """
-        Initialize feature processor.
-        
-        Args:
-            config: Model configuration
-        """
         super().__init__()
-        
+        self.config = config
+
+        # Feature encoders
         self.price_encoder = nn.Sequential(
             nn.Linear(1, config.n_embd // 4),
             nn.ReLU(),
@@ -90,46 +176,42 @@ class FinancialFeatureProcessor(nn.Module):
             nn.Linear(config.n_embd // 4, config.n_embd // 2)
         )
         
-        self.technical_encoder = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
-            nn.ReLU(),
-            nn.Linear(config.n_embd, config.n_embd)
-        )
-        
         self.options_encoder = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
+            nn.Linear(config.n_embd, config.n_embd // 2),
             nn.ReLU(),
-            nn.Linear(config.n_embd, config.n_embd)
+            nn.Linear(config.n_embd // 2, config.n_embd)
         )
         
+        self.technical_encoder = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd // 2),
+            nn.ReLU(),
+            nn.Linear(config.n_embd // 2, config.n_embd)
+        )
+
+        # Feature combiner
         self.feature_combiner = nn.Sequential(
             nn.Linear(config.n_embd * 2, config.n_embd),
-            nn.LayerNorm(config.n_embd),
-            nn.ReLU(),
-            nn.Dropout(config.resid_pdrop)
+            nn.ReLU()
         )
+
+    def forward(self, price, volume, options, technical):
+        # Process each feature type
+        price_encoded = self.price_encoder(price)  # [batch, seq_len, n_embd//2]
+        volume_encoded = self.volume_encoder(volume)  # [batch, seq_len, n_embd//2]
+        options_encoded = self.options_encoder(options)  # [batch, seq_len, n_embd]
+        technical_encoded = self.technical_encoder(technical)  # [batch, seq_len, n_embd]
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of feature processor.
-        
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, hidden_size)
-            
-        Returns:
-            Processed features of shape (batch_size, seq_len, hidden_size)
-        """
-        # For now, treat input as combined features
-        technical_features = self.technical_encoder(x)
-        options_features = self.options_encoder(x)
+        # Concatenate encoded features
+        combined = torch.cat([price_encoded, volume_encoded], dim=-1)
         
         # Combine features
-        combined = torch.cat([technical_features, options_features], dim=-1)
-        output = self.feature_combiner(combined)
-        
-        return output
+        return self.feature_combiner(combined)  # [batch, seq_len, n_embd]
 
-class OptionsGPT(GPT2PreTrainedModel):
+    def combine_features(self, features):
+        """Combine pre-encoded features."""
+        return self.feature_combiner(features)
+
+class OptionsGPT(nn.Module):
     """Custom GPT-2 model for options trading."""
     
     def __init__(self, config):
@@ -139,175 +221,135 @@ class OptionsGPT(GPT2PreTrainedModel):
         Args:
             config: Model configuration
         """
-        super().__init__(config)
+        super().__init__()
         
-        # Load pretrained GPT-2 model
-        self.transformer = GPT2Model(config)
+        # vocab_size=1 since we're not using tokens
+        gpt2_config = GPT2Config(
+            vocab_size=1,
+            n_positions=1024,
+            n_embd=768,
+            n_layer=12,
+            n_head=12,
+            n_inner=4 * 768,  # 4x embedding size
+            activation_function="gelu_new",
+            resid_pdrop=0.1,
+            embd_pdrop=0.1,
+            attn_pdrop=0.1,
+            layer_norm_epsilon=1e-5,
+            initializer_range=0.02,
+            scale_attn_by_inverse_layer_idx=True,
+            reorder_and_upcast_attn=True,
+            use_cache=False
+        )
         
-        # Add temporal attention
-        self.temporal_attention = TemporalAttention(config.n_embd)
-        
-        # Add financial feature processor
+        self.transformer = GPT2Model(gpt2_config)
         self.feature_processor = FinancialFeatureProcessor(config)
+        self.temporal_attention = TemporalAttention(config)
         
-        # Add custom layers for options trading
-        self.feature_projection = nn.Linear(config.n_embd, config.n_embd)
-        self.layer_norm = nn.LayerNorm(config.n_embd)
-        self.dropout = nn.Dropout(config.resid_pdrop)
-        
-        # Output layers for different prediction tasks
+        # Prediction heads with layer norm
         self.direction_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd // 2),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 2, 2)  # Binary classification (up/down)
+            nn.LayerNorm(config.n_embd),
+            nn.Linear(config.n_embd, 2)
         )
         
         self.return_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd // 2),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 2, 1)  # Return prediction
+            nn.LayerNorm(config.n_embd),
+            nn.Linear(config.n_embd, 1)
         )
         
         self.volatility_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd // 2),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 2, 1)  # Volatility prediction
+            nn.LayerNorm(config.n_embd),
+            nn.Linear(config.n_embd, 1)
         )
         
-        # Initialize weights
-        self.post_init()
+        # Loss functions
+        self.direction_loss_fct = nn.CrossEntropyLoss()
+        self.return_loss_fct = nn.MSELoss()
+        self.volatility_loss_fct = nn.MSELoss()
         
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
+    def save_pretrained(self, save_directory):
+        """Save model to the specified directory."""
+        import os
+        import torch
+        
+        os.makedirs(save_directory, exist_ok=True)
+        
+        # Save model state dict
+        model_path = os.path.join(save_directory, "pytorch_model.bin")
+        torch.save(self.state_dict(), model_path)
+        
+    @classmethod
+    def from_pretrained(cls, load_directory):
+        """Load model from the specified directory."""
+        import os
+        import torch
+        
+        # Create new model instance
+        config = GPT2Config(n_embd=768)  # Default config
+        model = cls(config)
+        
+        # Load state dict
+        model_path = os.path.join(load_directory, "pytorch_model.bin")
+        model.load_state_dict(torch.load(model_path))
+        
+        return model
+        
+    def forward(self, inputs_embeds=None, labels=None, output_attentions=False):
         """
         Forward pass of the model.
-        
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            token_type_ids: Token type IDs
-            position_ids: Position IDs
-            head_mask: Head mask
-            inputs_embeds: Input embeddings
-            labels: Labels for training
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output hidden states
-            return_dict: Whether to return a dictionary
-            
-        Returns:
-            Model outputs including predictions and loss
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        transformer_outputs = None
-        
-        # Process input features
-        if inputs_embeds is not None:
-            processed_features = self.feature_processor(inputs_embeds)
-            if output_attentions:
-                # Get transformer outputs for attention visualization
-                transformer_outputs = self.transformer(
-                    inputs_embeds=processed_features,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                    position_ids=position_ids,
-                    head_mask=head_mask,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
-                )
+        # Process features through temporal attention
+        if output_attentions:
+            hidden_states, attentions = self.temporal_attention(inputs_embeds, output_attentions=True)
         else:
-            # Get transformer outputs
-            transformer_outputs = self.transformer(
-                input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-            processed_features = transformer_outputs[0]
+            hidden_states = self.temporal_attention(inputs_embeds)
         
-        # Apply temporal attention
-        attended_features = self.temporal_attention(processed_features)
+        # Project to prediction heads
+        direction_logits = self.direction_head(hidden_states[:, -1, :])  # Use last timestep
+        return_preds = self.return_head(hidden_states[:, -1, :]).view(-1, 1)  # [batch_size, 1]
+        volatility_preds = self.volatility_head(hidden_states[:, -1, :]).view(-1, 1)  # [batch_size, 1]
         
-        # Project features
-        projected_features = self.feature_projection(attended_features)
-        projected_features = self.layer_norm(projected_features)
-        projected_features = self.dropout(projected_features)
+        # Get direction predictions
+        direction_preds = F.softmax(direction_logits, dim=-1)
         
-        # Get predictions from different heads (use last sequence element)
-        direction_logits = self.direction_head(projected_features[:, -1, :])
-        return_pred = self.return_head(projected_features[:, -1, :])
-        volatility_pred = self.volatility_head(projected_features[:, -1, :])
+        outputs = {
+            'direction_logits': direction_logits,
+            'direction_preds': direction_preds,
+            'return_pred': return_preds,  # [batch_size, 1]
+            'volatility_pred': volatility_preds  # [batch_size, 1]
+        }
         
-        # Calculate loss if labels are provided
-        loss = None
+        if output_attentions:
+            outputs['attentions'] = attentions
+        
         if labels is not None:
-            direction_labels = labels[:, 0].long()  # First column is direction (convert to long)
-            return_labels = labels[:, 1]  # Second column is return
-            volatility_labels = labels[:, 2]  # Third column is volatility
-            
-            # Loss functions
-            direction_loss_fct = nn.CrossEntropyLoss()
-            regression_loss_fct = nn.MSELoss()
+            direction_labels = labels[:, 0]
+            return_labels = labels[:, 1].view(-1, 1)  # Match shape with predictions
+            volatility_labels = labels[:, 2].view(-1, 1)  # Match shape with predictions
             
             # Calculate losses
-            direction_loss = direction_loss_fct(direction_logits, direction_labels)
-            return_loss = regression_loss_fct(return_pred.squeeze(), return_labels)
-            volatility_loss = regression_loss_fct(volatility_pred.squeeze(), volatility_labels)
+            direction_loss = self.direction_loss_fct(direction_logits, direction_labels.long())
+            return_loss = self.return_loss_fct(return_preds, return_labels)
+            volatility_loss = self.volatility_loss_fct(volatility_preds, volatility_labels)
             
-            # Combine losses with weights
-            loss = direction_loss + 0.5 * return_loss + 0.5 * volatility_loss
+            # Combined loss with higher weight on direction prediction
+            loss = 2.0 * direction_loss + 0.5 * return_loss + 0.5 * volatility_loss
+            outputs["loss"] = loss
+            
+        return outputs
+    
+    def predict(self, features):
+        """
+        Make predictions on input features.
+        """
+        outputs = self(inputs_embeds=features)
         
-        if not return_dict:
-            output = (direction_logits, return_pred, volatility_pred)
-            if transformer_outputs is not None:
-                output = output + transformer_outputs[2:]
-            return ((loss,) + output) if loss is not None else output
+        direction_preds = outputs['direction_preds']
+        direction = torch.argmax(direction_preds, dim=-1)
         
         return {
-            'loss': loss,
-            'direction_logits': direction_logits,
-            'return_pred': return_pred,
-            'volatility_pred': volatility_pred,
-            'hidden_states': transformer_outputs.hidden_states if transformer_outputs is not None and output_hidden_states else None,
-            'attentions': transformer_outputs.attentions if transformer_outputs is not None and output_attentions else None
-        }
-    
-    def predict(self, features: torch.Tensor) -> dict:
-        """
-        Make predictions on new data.
-        
-        Args:
-            features: Input features tensor
-            
-        Returns:
-            Dictionary containing predictions
-        """
-        self.eval()
-        with torch.no_grad():
-            outputs = self.forward(inputs_embeds=features)
-            
-            direction_probs = torch.softmax(outputs['direction_logits'], dim=-1)
-            direction_pred = direction_probs.argmax(dim=-1)
-            
-            return {
-                'direction': direction_pred,
-                'direction_prob': direction_probs,
-                'return': outputs['return_pred'],
-                'volatility': outputs['volatility_pred']
-            } 
+            'direction': direction,
+            'direction_prob': direction_preds,
+            'return': outputs['return_pred'],  # Already [batch_size, 1]
+            'volatility': outputs['volatility_pred']  # Already [batch_size, 1]
+        } 

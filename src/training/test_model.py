@@ -14,21 +14,21 @@ class TestTemporalAttention(unittest.TestCase):
     
     def setUp(self):
         """Set up test environment."""
-        self.hidden_size = 768
+        self.config = GPT2Config(n_embd=768)
         self.batch_size = 4
         self.seq_length = 30
-        self.attention = TemporalAttention(self.hidden_size)
+        self.attention = TemporalAttention(self.config)
         
     def test_attention_shape(self):
         """Test output shape of attention mechanism."""
-        x = torch.randn(self.batch_size, self.seq_length, self.hidden_size)
+        x = torch.randn(self.batch_size, self.seq_length, self.config.n_embd)
         output = self.attention(x)
         
         self.assertEqual(output.shape, x.shape)
         
     def test_attention_mask(self):
         """Test attention masking."""
-        x = torch.randn(self.batch_size, self.seq_length, self.hidden_size)
+        x = torch.randn(self.batch_size, self.seq_length, self.config.n_embd)
         mask = torch.ones(self.batch_size, self.seq_length, self.seq_length)
         mask[:, :, self.seq_length//2:] = 0  # Mask out second half
         
@@ -40,7 +40,7 @@ class TestTemporalAttention(unittest.TestCase):
         
     def test_attention_gradients(self):
         """Test gradient flow through attention."""
-        x = torch.randn(self.batch_size, self.seq_length, self.hidden_size, requires_grad=True)
+        x = torch.randn(self.batch_size, self.seq_length, self.config.n_embd, requires_grad=True)
         output = self.attention(x)
         loss = output.sum()
         loss.backward()

@@ -1,4 +1,4 @@
-# Default configuration for options trading model training
+# Training Configuration
 
 data:
   train_ratio: 0.7
@@ -14,15 +14,15 @@ model:
 
 training:
   batch_size: 32
-  learning_rate: 1.0e-4
-  num_epochs: 100
-  device: "cuda"
+  learning_rate: 0.0001
+  num_epochs: 1
+  device: "cpu"
   checkpoint_dir: "checkpoints"
   log_dir: "logs"
 
 early_stopping:
   patience: 5
-  min_delta: 1.0e-4
+  min_delta: 0.0001
 
 monitoring:
   use_wandb: false
