@@ -198,13 +198,15 @@ class FinancialFeatureProcessor(nn.Module):
         # Process each feature type
         price_encoded = self.price_encoder(price)  # [batch, seq_len, n_embd//2]
         volume_encoded = self.volume_encoder(volume)  # [batch, seq_len, n_embd//2]
-        options_encoded = self.options_encoder(options)  # [batch, seq_len, n_embd]
         technical_encoded = self.technical_encoder(technical)  # [batch, seq_len, n_embd]
         
-        # Concatenate encoded features
-        combined = torch.cat([price_encoded, volume_encoded], dim=-1)
+        # Concatenate price and volume features
+        price_volume = torch.cat([price_encoded, volume_encoded], dim=-1)  # [batch, seq_len, n_embd]
         
-        # Combine features
+        # Combine price_volume with technical features
+        combined = torch.cat([price_volume, technical_encoded], dim=-1)  # [batch, seq_len, n_embd*2]
+        
+        # Combine features through the feature combiner
         return self.feature_combiner(combined)  # [batch, seq_len, n_embd]
 
     def combine_features(self, features):
@@ -288,9 +290,9 @@ class OptionsGPT(nn.Module):
         config = GPT2Config(n_embd=768)  # Default config
         model = cls(config)
         
-        # Load state dict
+        # Load state dict with weights_only=True for security
         model_path = os.path.join(load_directory, "pytorch_model.bin")
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, weights_only=True))
         
         return model
         

@@ -47,8 +47,11 @@ def train_model(config: TrainingConfiguration, data_path: str):
     setup_logging(config.training.log_dir)
     logger = logging.getLogger(__name__)
     
+    # Create log directory if it doesn't exist
+    os.makedirs(config.training.log_dir, exist_ok=True)
+    
     # Set up tensorboard
-    writer = SummaryWriter(config.training.log_dir)
+    writer = SummaryWriter(log_dir=config.training.log_dir)
     
     # Initialize wandb if enabled
     if config.monitoring.use_wandb:
@@ -131,15 +134,14 @@ def train_model(config: TrainingConfiguration, data_path: str):
             if config.monitoring.use_wandb:
                 wandb.log({f"val/{metric}": value}, step=epoch)
         
-        # Save checkpoint
-        trainer.save_checkpoint(val_metrics, epoch + 1)
-        
         # Early stopping
         if val_metrics['loss'] < best_val_loss - config.early_stopping.min_delta:
             best_val_loss = val_metrics['loss']
             patience_counter = 0
+            logger.info(f"Validation loss improved to {best_val_loss:.4f}")
         else:
             patience_counter += 1
+            logger.info(f"Validation loss did not improve. Patience: {patience_counter}/{config.early_stopping.patience}")
             
         if patience_counter >= config.early_stopping.patience:
             logger.info(
@@ -147,6 +149,10 @@ def train_model(config: TrainingConfiguration, data_path: str):
                 f"Best validation loss: {best_val_loss:.4f}"
             )
             break
+            
+        # Save checkpoint only if validation loss improved
+        if patience_counter == 0:
+            trainer.save_checkpoint(val_metrics, epoch + 1)
     
     # Final evaluation on test set
     logger.info("Evaluating on test set...")
