@@ -81,8 +81,11 @@ def prepare_data(
     scaler = StandardScaler()
     features = scaler.fit_transform(features)
     
-    # Convert to tensors
-    features = torch.FloatTensor(features)
+    # Project features to model dimension (768) using a random projection
+    projection = torch.randn(len(feature_cols), 768) / np.sqrt(len(feature_cols))
+    features = torch.FloatTensor(features) @ projection
+    
+    # Convert labels to tensors
     direction_labels = torch.FloatTensor(direction_labels)
     return_labels = torch.FloatTensor(return_labels)
     volatility_labels = torch.FloatTensor(volatility_labels)

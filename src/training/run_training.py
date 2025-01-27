@@ -35,6 +35,90 @@ def setup_logging(log_dir: str) -> None:
         ]
     )
 
+def validate_data(train_dataset, val_dataset, test_dataset, logger):
+    """
+    Validate the prepared datasets.
+    
+    Args:
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        test_dataset: Test dataset
+        logger: Logger instance
+    """
+    logger.info("\nValidating prepared data:")
+    logger.info("-" * 50)
+    
+    # Check dataset sizes
+    total_samples = len(train_dataset) + len(val_dataset) + len(test_dataset)
+    logger.info(f"Total samples: {total_samples}")
+    logger.info(f"Train samples: {len(train_dataset)} ({len(train_dataset)/total_samples:.1%})")
+    logger.info(f"Val samples: {len(val_dataset)} ({len(val_dataset)/total_samples:.1%})")
+    logger.info(f"Test samples: {len(test_dataset)} ({len(test_dataset)/total_samples:.1%})")
+    
+    # Check feature dimensions
+    features, labels = train_dataset[0]
+    logger.info(f"\nFeature dimensions: {features.shape}")
+    logger.info(f"Label dimensions: {labels.shape}")
+    
+    # Analyze label distribution
+    train_labels = torch.stack([labels for _, labels in train_dataset])
+    val_labels = torch.stack([labels for _, labels in val_dataset])
+    test_labels = torch.stack([labels for _, labels in test_dataset])
+    
+    # Direction distribution
+    train_direction = train_labels[:, 0]
+    val_direction = val_labels[:, 0]
+    test_direction = test_labels[:, 0]
+    
+    logger.info("\nDirection label distribution:")
+    logger.info(f"Train - Down (-1): {(train_direction == -1).float().mean():.1%}, "
+               f"Neutral (0): {(train_direction == 0).float().mean():.1%}, "
+               f"Up (1): {(train_direction == 1).float().mean():.1%}")
+    logger.info(f"Val   - Down (-1): {(val_direction == -1).float().mean():.1%}, "
+               f"Neutral (0): {(val_direction == 0).float().mean():.1%}, "
+               f"Up (1): {(val_direction == 1).float().mean():.1%}")
+    logger.info(f"Test  - Down (-1): {(test_direction == -1).float().mean():.1%}, "
+               f"Neutral (0): {(test_direction == 0).float().mean():.1%}, "
+               f"Up (1): {(test_direction == 1).float().mean():.1%}")
+    
+    # Returns statistics
+    train_returns = train_labels[:, 1]
+    val_returns = val_labels[:, 1]
+    test_returns = test_labels[:, 1]
+    
+    logger.info("\nReturns statistics:")
+    logger.info(f"Train - Mean: {train_returns.mean():.4f}, Std: {train_returns.std():.4f}")
+    logger.info(f"Val   - Mean: {val_returns.mean():.4f}, Std: {val_returns.std():.4f}")
+    logger.info(f"Test  - Mean: {test_returns.mean():.4f}, Std: {test_returns.std():.4f}")
+    
+    # Volatility statistics
+    train_vol = train_labels[:, 2]
+    val_vol = val_labels[:, 2]
+    test_vol = test_labels[:, 2]
+    
+    logger.info("\nVolatility statistics:")
+    logger.info(f"Train - Mean: {train_vol.mean():.4f}, Std: {train_vol.std():.4f}")
+    logger.info(f"Val   - Mean: {val_vol.mean():.4f}, Std: {val_vol.std():.4f}")
+    logger.info(f"Test  - Mean: {test_vol.mean():.4f}, Std: {test_vol.std():.4f}")
+    
+    # Check for NaN/Inf values
+    def check_invalid_values(tensor, name):
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        if nan_count > 0 or inf_count > 0:
+            logger.warning(f"\nFound invalid values in {name}:")
+            logger.warning(f"NaN count: {nan_count}")
+            logger.warning(f"Inf count: {inf_count}")
+    
+    logger.info("\nChecking for invalid values...")
+    for dataset, name in [(train_dataset, "train"), (val_dataset, "val"), (test_dataset, "test")]:
+        features, labels = next(iter(torch.utils.data.DataLoader(dataset, batch_size=len(dataset))))
+        check_invalid_values(features, f"{name} features")
+        check_invalid_values(labels, f"{name} labels")
+    
+    logger.info("\nData validation completed.")
+    logger.info("-" * 50)
+
 def train_model(config: TrainingConfiguration, data_path: str):
     """
     Train the model with given configuration.
@@ -79,6 +163,10 @@ def train_model(config: TrainingConfiguration, data_path: str):
         test_ratio=config.data.test_ratio,
         seq_length=config.data.seq_length
     )
+    
+    # Validate prepared data
+    validate_data(train_dataset, val_dataset, test_dataset, logger)
+    
     logger.info(
         f"Dataset sizes - Train: {len(train_dataset)}, "
         f"Val: {len(val_dataset)}, Test: {len(test_dataset)}"
@@ -106,53 +194,13 @@ def train_model(config: TrainingConfiguration, data_path: str):
         learning_rate=config.training.learning_rate,
         num_epochs=config.training.num_epochs,
         device=device,
-        checkpoint_dir=config.training.checkpoint_dir
+        checkpoint_dir=config.training.checkpoint_dir,
+        log_interval=100
     )
     
-    # Training loop with monitoring
-    best_val_loss = float('inf')
-    patience_counter = 0
-    
-    for epoch in range(config.training.num_epochs):
-        logger.info(f"Epoch {epoch + 1}/{config.training.num_epochs}")
-        
-        # Train
-        train_metrics = trainer.train_epoch()
-        logger.info("Training metrics:")
-        for metric, value in train_metrics.items():
-            logger.info(f"{metric}: {value:.4f}")
-            writer.add_scalar(f"train/{metric}", value, epoch)
-            if config.monitoring.use_wandb:
-                wandb.log({f"train/{metric}": value}, step=epoch)
-        
-        # Validate
-        val_metrics = trainer.evaluate(trainer.val_loader)
-        logger.info("Validation metrics:")
-        for metric, value in val_metrics.items():
-            logger.info(f"{metric}: {value:.4f}")
-            writer.add_scalar(f"val/{metric}", value, epoch)
-            if config.monitoring.use_wandb:
-                wandb.log({f"val/{metric}": value}, step=epoch)
-        
-        # Early stopping
-        if val_metrics['loss'] < best_val_loss - config.early_stopping.min_delta:
-            best_val_loss = val_metrics['loss']
-            patience_counter = 0
-            logger.info(f"Validation loss improved to {best_val_loss:.4f}")
-        else:
-            patience_counter += 1
-            logger.info(f"Validation loss did not improve. Patience: {patience_counter}/{config.early_stopping.patience}")
-            
-        if patience_counter >= config.early_stopping.patience:
-            logger.info(
-                f"Early stopping triggered after {epoch + 1} epochs. "
-                f"Best validation loss: {best_val_loss:.4f}"
-            )
-            break
-            
-        # Save checkpoint only if validation loss improved
-        if patience_counter == 0:
-            trainer.save_checkpoint(val_metrics, epoch + 1)
+    # Train model
+    logger.info("Starting training...")
+    trainer.train()
     
     # Final evaluation on test set
     logger.info("Evaluating on test set...")

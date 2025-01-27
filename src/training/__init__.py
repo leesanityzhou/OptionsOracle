@@ -1,7 +1,8 @@
 """
-Training package for options trading models.
+Training module for options trading model.
 """
 
-from .model import OptionsGPT, TemporalAttention, FinancialFeatureProcessor
+from .model import OptionsGPT, OptionsDataset, OptionsGPTConfig
+from .trainer import OptionsTrainer
 
-__all__ = ['OptionsGPT', 'TemporalAttention', 'FinancialFeatureProcessor'] 
+__all__ = ['OptionsGPT', 'OptionsDataset', 'OptionsGPTConfig', 'OptionsTrainer'] 

@@ -1,357 +1,347 @@
-"""
-Custom model architecture for options trading.
-"""
-
+import os
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2PreTrainedModel, GPT2Model, PretrainedConfig, GPT2Config
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-from typing import Optional
-import math
+from torch.utils.data import Dataset
+from typing import Optional, Dict, Tuple
 
-class OptionsGPTConfig(PretrainedConfig):
-    """Configuration class for OptionsGPT model."""
-    model_type = "options_gpt"
-
+class OptionsGPTConfig:
+    """
+    Simple configuration class for OptionsGPT model.
+    Adjust fields as necessary for your use case.
+    """
     def __init__(
         self,
-        hidden_size=768,
-        num_layers=12,
-        num_heads=12,
-        dropout=0.1,
-        vocab_size=50257,  # Default GPT2 vocab size
-        n_positions=1024,  # Default GPT2 max sequence length
-        n_ctx=1024,  # Default GPT2 context size
-        n_embd=None,  # Will be set to hidden_size
-        n_layer=None,  # Will be set to num_layers
-        n_head=None,  # Will be set to num_heads
-        n_inner=None,  # Will be set to hidden_size * 4
-        activation_function="gelu_new",  # Default GPT2 activation
-        resid_pdrop=None,  # Will be set to dropout
-        embd_pdrop=None,  # Will be set to dropout
-        attn_pdrop=None,  # Will be set to dropout
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        summary_type="cls_index",
-        summary_use_proj=True,
-        summary_activation=None,
-        summary_proj_to_labels=True,
-        summary_first_dropout=0.1,
-        use_cache=True,
-        bos_token_id=50256,
-        eos_token_id=50256,
-        scale_attn_weights=True,
-        scale_attn_by_inverse_layer_idx=False,
-        reorder_and_upcast_attn=False,
-        **kwargs
+        n_embd: int = 768,
+        n_head: int = 8,
+        n_layer: int = 3,
+        n_positions: int = 256,
+        n_features: int = 15,
+        dropout: float = 0.25
     ):
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            **kwargs
-        )
-        
-        # Set main parameters
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.dropout = dropout
-        
-        # Set required GPT2 parameters
-        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_layer = n_layer
         self.n_positions = n_positions
-        self.n_ctx = n_ctx
-        self.max_position_embeddings = n_positions
-        
-        # Set aliases for GPT2 compatibility
-        self.n_embd = hidden_size if n_embd is None else n_embd
-        self.n_layer = num_layers if n_layer is None else n_layer
-        self.n_head = num_heads if n_head is None else n_head
-        self.n_inner = hidden_size * 4 if n_inner is None else n_inner
-        self.num_hidden_layers = self.n_layer  # Required by GPT2
-        self.num_attention_heads = self.n_head  # Required by GPT2
-        
-        # Set dropout aliases
-        self.resid_pdrop = dropout if resid_pdrop is None else resid_pdrop
-        self.embd_pdrop = dropout if embd_pdrop is None else embd_pdrop
-        self.attn_pdrop = dropout if attn_pdrop is None else attn_pdrop
-        
-        # Set additional required GPT2 parameters
-        self.layer_norm_epsilon = layer_norm_epsilon
-        self.initializer_range = initializer_range
-        self.summary_type = summary_type
-        self.summary_use_proj = summary_use_proj
-        self.summary_activation = summary_activation
-        self.summary_first_dropout = summary_first_dropout
-        self.summary_proj_to_labels = summary_proj_to_labels
-        self.activation_function = activation_function
-        self.scale_attn_weights = scale_attn_weights
-        self.use_cache = use_cache
-        self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
-        self.reorder_and_upcast_attn = reorder_and_upcast_attn
+        self.n_features = n_features
+        self.dropout = dropout
 
-class FeatureProcessor(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super().__init__()
-        self.feature_projection = nn.Linear(hidden_size, hidden_size)  # Project from hidden_size to hidden_size
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, x):
-        # Handle both 3D and 4D inputs
-        if len(x.shape) == 3:
-            # [batch_size, seq_len, hidden_size]
-            batch_size, seq_len, hidden_size = x.shape
-        else:
-            # [batch_size, 1, seq_len, hidden_size]
-            batch_size, _, seq_len, hidden_size = x.shape
-            x = x.squeeze(1)  # Remove the extra dimension
-        
-        # Project features
-        x = self.feature_projection(x)  # [batch_size, seq_len, hidden_size]
-        x = self.layer_norm(x)
-        x = self.dropout(x)
-        
-        return x  # Return in 3D format [batch_size, seq_len, hidden_size]
-
-class TemporalAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        
-        # Multi-head attention
-        self.n_head = config.n_head
-        self.head_dim = config.n_embd // config.n_head
-        self.query = nn.Linear(config.n_embd, config.n_embd)
-        self.key = nn.Linear(config.n_embd, config.n_embd)
-        self.value = nn.Linear(config.n_embd, config.n_embd)
-        self.attn_drop = nn.Dropout(config.resid_pdrop)
-        self.resid_drop = nn.Dropout(config.resid_pdrop)
-        self.proj = nn.Linear(config.n_embd, config.n_embd)
-        
-    def forward(self, x, mask=None, output_attentions=False):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
-        
-        # Linear projections
-        q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
-        k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
-        v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
-        
-        # Compute attention scores
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, T)
-        
-        if mask is not None:
-            att = att.masked_fill(mask[:, None, :, :] == 0, float('-inf'))
-        
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        
-        # Apply attention to values
-        y = att @ v  # (B, nh, T, hd)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
-        
-        # Output projection
-        y = self.resid_drop(self.proj(y))
-        
-        if output_attentions:
-            return y, att
-        return y
-
-class FinancialFeatureProcessor(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        # Feature encoders
-        self.price_encoder = nn.Sequential(
-            nn.Linear(1, config.n_embd // 4),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 4, config.n_embd // 2)
-        )
-        
-        self.volume_encoder = nn.Sequential(
-            nn.Linear(1, config.n_embd // 4),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 4, config.n_embd // 2)
-        )
-        
-        self.options_encoder = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd // 2),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 2, config.n_embd)
-        )
-        
-        self.technical_encoder = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd // 2),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 2, config.n_embd)
-        )
-
-        # Feature combiner
-        self.feature_combiner = nn.Sequential(
-            nn.Linear(config.n_embd * 2, config.n_embd),
-            nn.ReLU()
-        )
-
-    def forward(self, price, volume, options, technical):
-        # Process each feature type
-        price_encoded = self.price_encoder(price)  # [batch, seq_len, n_embd//2]
-        volume_encoded = self.volume_encoder(volume)  # [batch, seq_len, n_embd//2]
-        technical_encoded = self.technical_encoder(technical)  # [batch, seq_len, n_embd]
-        
-        # Concatenate price and volume features
-        price_volume = torch.cat([price_encoded, volume_encoded], dim=-1)  # [batch, seq_len, n_embd]
-        
-        # Combine price_volume with technical features
-        combined = torch.cat([price_volume, technical_encoded], dim=-1)  # [batch, seq_len, n_embd*2]
-        
-        # Combine features through the feature combiner
-        return self.feature_combiner(combined)  # [batch, seq_len, n_embd]
-
-    def combine_features(self, features):
-        """Combine pre-encoded features."""
-        return self.feature_combiner(features)
 
 class OptionsGPT(nn.Module):
-    """Custom GPT-2 model for options trading."""
-    
-    def __init__(self, config):
-        """
-        Initialize the model.
-        
-        Args:
-            config: Model configuration
-        """
+    """
+    Improved OptionsGPT model for time-series (e.g. stock/options) prediction.
+    """
+
+    def __init__(self, config: OptionsGPTConfig) -> None:
         super().__init__()
+        self.config = config
         
-        # vocab_size=1 since we're not using tokens
-        gpt2_config = GPT2Config(
-            vocab_size=1,
-            n_positions=1024,
-            n_embd=768,
-            n_layer=12,
-            n_head=12,
-            n_inner=4 * 768,  # 4x embedding size
-            activation_function="gelu_new",
-            resid_pdrop=0.1,
-            embd_pdrop=0.1,
-            attn_pdrop=0.1,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            scale_attn_by_inverse_layer_idx=True,
-            reorder_and_upcast_attn=True,
-            use_cache=False
-        )
-        
-        self.transformer = GPT2Model(gpt2_config)
-        self.feature_processor = FinancialFeatureProcessor(config)
-        self.temporal_attention = TemporalAttention(config)
-        
-        # Prediction heads with layer norm
-        self.direction_head = nn.Sequential(
+        # ------------------------------------------------------------------
+        # 1) Feature Interaction Layers (process features independently at each timestep)
+        # ------------------------------------------------------------------
+        self.feature_layers = nn.Sequential(
+            nn.Linear(config.n_features, config.n_embd),
             nn.LayerNorm(config.n_embd),
-            nn.Linear(config.n_embd, 2)
-        )
-        
-        self.return_head = nn.Sequential(
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            
+            nn.Linear(config.n_embd, config.n_embd),
             nn.LayerNorm(config.n_embd),
-            nn.Linear(config.n_embd, 1)
-        )
-        
-        self.volatility_head = nn.Sequential(
+            nn.GELU(),
+            nn.Dropout(config.dropout + 0.05),
+            
+            nn.Linear(config.n_embd, config.n_embd),
             nn.LayerNorm(config.n_embd),
-            nn.Linear(config.n_embd, 1)
+            nn.GELU(),
+            nn.Dropout(config.dropout + 0.1)
         )
         
-        # Loss functions
-        self.direction_loss_fct = nn.CrossEntropyLoss()
-        self.return_loss_fct = nn.MSELoss()
-        self.volatility_loss_fct = nn.MSELoss()
+        # ------------------------------------------------------------------
+        # 2) Positional Encoding
+        #    Create a parameter for maximum sequence length. We'll slice it at runtime.
+        # ------------------------------------------------------------------
+        self.pos_encoder = nn.Parameter(torch.zeros(1, config.n_positions, config.n_embd))
         
-    def save_pretrained(self, save_directory):
-        """Save model to the specified directory."""
-        import os
-        import torch
+        # ------------------------------------------------------------------
+        # 3) Temporal Transformer Blocks
+        #    Each block has MultiheadAttention + a feed-forward MLP
+        # ------------------------------------------------------------------
+        self.temporal_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'attention': nn.MultiheadAttention(config.n_embd, config.n_head, dropout=config.dropout, batch_first=True),
+                'attn_norm': nn.LayerNorm(config.n_embd),
+                'ffn': nn.Sequential(
+                    nn.Linear(config.n_embd, config.n_embd * 4),
+                    nn.GELU(),
+                    nn.Dropout(config.dropout),
+                    nn.Linear(config.n_embd * 4, config.n_embd)
+                ),
+                'ffn_norm': nn.LayerNorm(config.n_embd)
+            })
+            for _ in range(config.n_layer)
+        ])
         
+        # ------------------------------------------------------------------
+        # 4) Combine feature and temporal info
+        # ------------------------------------------------------------------
+        self.combine_layer = nn.Sequential(
+            nn.Linear(config.n_embd * 2, config.n_embd),
+            nn.LayerNorm(config.n_embd),
+            nn.GELU(),
+            nn.Dropout(config.dropout)
+        )
+        
+        # ------------------------------------------------------------------
+        # 5) Final Prediction (price or next-day target)
+        # ------------------------------------------------------------------
+        self.price_head = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.n_embd // 2, 1)
+        )
+
+    def forward(self, 
+                features: torch.Tensor, 
+                time_weights: Optional[torch.Tensor] = None
+               ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            features: [batch_size, seq_len, n_features]
+            time_weights: [seq_len] or [batch_size, seq_len] (optional)
+                          If provided, applies weighting before pooling.
+        
+        Returns:
+            Dictionary with 'price_pred': [batch_size]
+        """
+        # ------------------------------------
+        # 1) Feature interaction at each timestep
+        # ------------------------------------
+        batch_size, seq_len, n_features = features.shape
+        assert n_features == self.config.n_features, \
+            f"Expected input feature size {self.config.n_features}, got {n_features}"
+
+        # Flatten => transform => unflatten
+        x = features.reshape(batch_size * seq_len, n_features)
+        x = self.feature_layers(x)
+        x = x.reshape(batch_size, seq_len, -1)  # => [B, T, n_embd]
+        feature_info = x  # Store feature information
+        
+        # ------------------------------------
+        # 2) Add positional encodings
+        # ------------------------------------
+        if seq_len > self.config.n_positions:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds maximum position encoding {self.config.n_positions}."
+            )
+        pos_enc = self.pos_encoder[:, :seq_len, :]  # => [1, seq_len, n_embd]
+        x = x + pos_enc
+        
+        # ------------------------------------
+        # 3) Temporal attention blocks
+        # ------------------------------------
+        for block in self.temporal_layers:
+            # Multihead attention
+            attn_out, _ = block['attention'](x, x, x, need_weights=False)  # [B, T, n_embd]
+            x = block['attn_norm'](x + attn_out)
+            
+            # Feed-forward
+            ffn_out = block['ffn'](x)   # [B, T, n_embd]
+            x = block['ffn_norm'](x + ffn_out)
+        
+        temporal_info = x  # Store temporal information
+        
+        # ------------------------------------
+        # 4) Pooling with optional time weights
+        # ------------------------------------
+        if time_weights is not None:
+            # If time_weights is 1D [seq_len], expand to [batch_size, seq_len]
+            if time_weights.dim() == 1:
+                time_weights = time_weights.unsqueeze(0).expand(batch_size, seq_len)
+            elif time_weights.dim() == 2:
+                # Should match (batch_size, seq_len)
+                assert time_weights.shape == (batch_size, seq_len), \
+                    "time_weights must match (batch_size, seq_len) if 2D."
+            else:
+                raise ValueError("time_weights must be 1D [seq_len] or 2D [batch_size, seq_len].")
+            
+            # Weighted sum
+            time_weights = time_weights.unsqueeze(-1)  # => [B, T, 1]
+            temporal_info = torch.sum(temporal_info * time_weights, dim=1)  # => [B, n_embd]
+            feature_info = torch.sum(feature_info * time_weights, dim=1)  # => [B, n_embd]
+        else:
+            # Simple mean pooling
+            temporal_info = temporal_info.mean(dim=1)  # => [B, n_embd]
+            feature_info = feature_info.mean(dim=1)  # => [B, n_embd]
+        
+        # ------------------------------------
+        # 5) Combine and predict
+        # ------------------------------------
+        combined = torch.cat([feature_info, temporal_info], dim=-1)  # => [B, 2*n_embd]
+        combined = self.combine_layer(combined)                      # => [B, n_embd]
+        price_pred = self.price_head(combined).squeeze(-1)          # => [B]
+
+        return {
+            'price_pred': price_pred
+        }
+
+    @torch.no_grad()
+    def predict(self, features: torch.Tensor, time_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Convenience method for inference. 
+        Args:
+            features: [batch_size, seq_len, n_features]
+            time_weights: optional, same shape considerations as forward
+
+        Returns:
+            price_pred: [batch_size]
+        """
+        self.eval()
+        outputs = self(features, time_weights)
+        return outputs['price_pred']
+
+    def save_pretrained(self, save_directory: str):
+        """
+        Save model weights and config.
+        """
         os.makedirs(save_directory, exist_ok=True)
         
-        # Save model state dict
+        # Save state dict
         model_path = os.path.join(save_directory, "pytorch_model.bin")
         torch.save(self.state_dict(), model_path)
         
+        # Save config
+        config_path = os.path.join(save_directory, "config.pt")
+        torch.save(self.config, config_path)
+
     @classmethod
-    def from_pretrained(cls, load_directory):
-        """Load model from the specified directory."""
-        import os
-        import torch
+    def from_pretrained(cls, load_directory: str):
+        """
+        Load model from directory.
+        """
+        model_path = os.path.join(load_directory, "pytorch_model.bin")
+        config_path = os.path.join(load_directory, "config.pt")
         
-        # Create new model instance
-        config = GPT2Config(n_embd=768)  # Default config
+        # Load config
+        config = torch.load(config_path)
         model = cls(config)
         
-        # Load state dict with weights_only=True for security
-        model_path = os.path.join(load_directory, "pytorch_model.bin")
-        model.load_state_dict(torch.load(model_path, weights_only=True))
+        # Load weights
+        state_dict = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
         
         return model
-        
-    def forward(self, inputs_embeds=None, labels=None, output_attentions=False):
+
+
+class OptionsDataset(Dataset):
+    """
+    Simple dataset to produce sequences for next-day price prediction.
+    """
+    def __init__(self,
+                 features: torch.Tensor,
+                 labels: torch.Tensor,
+                 seq_length: int = 10) -> None:
         """
-        Forward pass of the model.
+        Args:
+            features: shape [num_samples, n_features]
+            labels:   shape [num_samples]
+            seq_length: number of timesteps per sample
         """
-        # Process features through temporal attention
-        if output_attentions:
-            hidden_states, attentions = self.temporal_attention(inputs_embeds, output_attentions=True)
-        else:
-            hidden_states = self.temporal_attention(inputs_embeds)
+        self.features = features
+        self.labels = labels
+        self.seq_length = seq_length
         
-        # Project to prediction heads
-        direction_logits = self.direction_head(hidden_states[:, -1, :])  # Use last timestep
-        return_preds = self.return_head(hidden_states[:, -1, :]).view(-1, 1)  # [batch_size, 1]
-        volatility_preds = self.volatility_head(hidden_states[:, -1, :]).view(-1, 1)  # [batch_size, 1]
+        # Example of exponential time weights:
+        self.time_weights = torch.exp(torch.linspace(0, 1, seq_length))
+        self.time_weights /= self.time_weights.sum()  # Normalize
+
+    def __len__(self):
+        return max(0, len(self.features) - self.seq_length)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            feature_seq: [seq_length, n_features]
+            label:       float (the next day's price or same-day price)
+            time_weights: [seq_length] (just an example usage)
+        """
+        feature_seq = self.features[idx:idx + self.seq_length]  # shape [seq_length, n_features]
         
-        # Get direction predictions
-        direction_preds = F.softmax(direction_logits, dim=-1)
+        # Next-day label: you might want to shift by +1 to truly be "next day"
+        # but for demonstration, let's just take the last day in the window.
+        label = self.labels[idx + self.seq_length - 1]
         
-        outputs = {
-            'direction_logits': direction_logits,
-            'direction_preds': direction_preds,
-            'return_pred': return_preds,  # [batch_size, 1]
-            'volatility_pred': volatility_preds  # [batch_size, 1]
-        }
-        
-        if output_attentions:
-            outputs['attentions'] = attentions
-        
-        if labels is not None:
-            direction_labels = labels[:, 0]
-            return_labels = labels[:, 1].view(-1, 1)  # Match shape with predictions
-            volatility_labels = labels[:, 2].view(-1, 1)  # Match shape with predictions
-            
-            # Calculate losses
-            direction_loss = self.direction_loss_fct(direction_logits, direction_labels.long())
-            return_loss = self.return_loss_fct(return_preds, return_labels)
-            volatility_loss = self.volatility_loss_fct(volatility_preds, volatility_labels)
-            
-            # Combined loss with higher weight on direction prediction
-            loss = 2.0 * direction_loss + 0.5 * return_loss + 0.5 * volatility_loss
-            outputs["loss"] = loss
-            
-        return outputs
+        return feature_seq, label, self.time_weights
+
+
+# -------------------------------
+# Example Usage
+# -------------------------------
+if __name__ == "__main__":
+    # Hypothetical dataset: 100 samples, each with 15 features
+    num_samples = 120
+    n_features = 15
+    seq_length = 10
     
-    def predict(self, features):
-        """
-        Make predictions on input features.
-        """
-        outputs = self(inputs_embeds=features)
+    # Mock data
+    dummy_features = torch.randn(num_samples, n_features)
+    dummy_labels   = torch.randn(num_samples)  # e.g. next-day price or any numeric target
+    
+    # Dataset & dataloader
+    dataset = OptionsDataset(dummy_features, dummy_labels, seq_length=seq_length)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
+    
+    # Model config & initialization
+    config = OptionsGPTConfig(
+        n_embd=64,
+        n_head=4,
+        n_layer=2,
+        n_positions=seq_length,
+        n_features=n_features,
+        dropout=0.25
+    )
+    model = OptionsGPT(config)
+    
+    # Simple training loop (illustrative only)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+    
+    for epoch in range(2):
+        model.train()
+        total_loss = 0.0
         
-        direction_preds = outputs['direction_preds']
-        direction = torch.argmax(direction_preds, dim=-1)
+        for batch_features, batch_labels, time_weights in dataloader:
+            # Forward
+            out = model(batch_features, time_weights)
+            price_pred = out['price_pred']
+            
+            # Compute loss
+            loss = criterion(price_pred, batch_labels)
+            
+            # Backprop
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
         
-        return {
-            'direction': direction,
-            'direction_prob': direction_preds,
-            'return': outputs['return_pred'],  # Already [batch_size, 1]
-            'volatility': outputs['volatility_pred']  # Already [batch_size, 1]
-        } 
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1}, Loss = {avg_loss:.4f}")
+    
+    # Example of saving & loading
+    save_dir = "my_options_gpt_model"
+    model.save_pretrained(save_dir)
+    
+    loaded_model = OptionsGPT.from_pretrained(save_dir)
+    loaded_model.eval()
+    
+    # Single inference example
+    test_seq = dummy_features[0:seq_length].unsqueeze(0) # => [1, seq_length, n_features]
+    test_weights = dataset.time_weights.unsqueeze(0)     # => [1, seq_length]
+    
+    with torch.no_grad():
+        prediction = loaded_model.predict(test_seq, test_weights)
+    print("Prediction for first sample:", prediction.item())
